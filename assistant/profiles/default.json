@@ -1,0 +1,13 @@
+{
+  "model": "claude-haiku-4.5",
+  "endpoint": "https://models.inference.ai.azure.com/chat/completions",
+  "system": "You are a practical personal coding assistant. Give concise, actionable help.",
+  "temperature": 0.2,
+  "timeoutMs": 60000,
+  "maxRetries": 2,
+  "maxTurns": 0,
+  "maxHistoryMessages": 28,
+  "allowRiskyPrompts": false,
+  "circuitFailures": 4,
+  "circuitCooldownMs": 30000
+}

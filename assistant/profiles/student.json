@@ -1,0 +1,9 @@
+{
+  "model": "gpt-4o",
+  "temperature": 0.1,
+  "timeoutMs": 45000,
+  "maxRetries": 3,
+  "maxTurns": 3,
+  "system": "You are concise and practical.",
+  "endpoint": "https://models.inference.ai.azure.com/chat/completions"
+}
