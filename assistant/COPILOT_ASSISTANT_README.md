@@ -104,6 +104,17 @@ Single prompt mode:
 - `--github-copilot-auth`
 - `--no-github-copilot-auth`
 
+## Output format tuning
+
+The assistant now uses a polished default response style (clean Markdown sections, concise bullets, and actionable next steps).
+
+To fully customize style for your own preferences, set `COPILOT_ASSISTANT_SYSTEM`:
+
+```bash
+export COPILOT_ASSISTANT_SYSTEM="You are a concise coding assistant. Use short markdown headings and bullet lists."
+./scripts/launch-copilot-assistant.sh
+```
+
 ## Interactive slash commands
 
 Inside interactive mode, you can use:
@@ -272,6 +283,17 @@ Example with custom endpoint:
   --model "your-model-name" \
   --prompt "hello"
 ```
+
+Example with GitHub Models direct endpoint:
+
+```bash
+./scripts/launch-copilot-assistant.sh \
+  --endpoint "https://models.github.ai/inference/chat/completions" \
+  --model "openai/gpt-4.1-mini" \
+  --prompt "hello"
+```
+
+When `models.github.ai` is used as the endpoint host, the assistant keeps direct mode (no runtime endpoint rebinding), applies GitHub API compatibility headers, and uses the `/catalog/models` path for model listing.
 
 ## Important note
 

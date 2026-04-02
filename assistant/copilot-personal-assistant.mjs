@@ -19,13 +19,11 @@ const DEFAULT_QUEUE_MAX_PENDING = 32
 const DEFAULT_MAX_HISTORY_MESSAGES = 28
 const DEFAULT_CIRCUIT_FAILURES = 4
 const DEFAULT_CIRCUIT_COOLDOWN_MS = 30 * 1000
-const COPILOT_RUNTIME_TOKEN_URLS = (
-  process.env.COPILOT_RUNTIME_TOKEN_URLS ||
-  'https://api.github.com/copilot_internal/v2/token,https://api.github.com/copilot_internal/token'
-)
-  .split(',')
-  .map(v => v.trim())
-  .filter(Boolean)
+const DEFAULT_COPILOT_RUNTIME_TOKEN_URLS = [
+  'https://api.github.com/copilot_internal/v2/token',
+  'https://api.github.com/copilot_internal/token',
+]
+const COPILOT_RUNTIME_TOKEN_URLS = resolveCopilotRuntimeTokenUrls(process.env)
 const DEFAULT_COPILOT_RUNTIME_BASE_URL = 'https://api.individual.githubcopilot.com'
 const COPILOT_RUNTIME_TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000
 const COPILOT_RUNTIME_TOKEN_CACHE_PATH = path.join(
@@ -46,6 +44,16 @@ const MODEL_PROVIDER_PREFIXES = [
   'google/',
   'xai/',
 ]
+
+const DEFAULT_ASSISTANT_SYSTEM_PROMPT = [
+  'You are a practical personal coding assistant.',
+  'Respond with clean, modern Markdown that looks polished in terminal output.',
+  'Start with a direct answer, then use short sections for detail when needed.',
+  'Use concise bullet points for features/steps and numbered phases for build plans.',
+  'For product/app requests, include: concept, core features, stack, implementation phases, and deployment path.',
+  'If scope is too large for one shot, propose an MVP first and clearly state the immediate next step.',
+  'Keep the tone practical, clear, and concise.',
+].join('\n')
 
 const RISKY_PROMPT_RULES = [
   { id: 'rm_root', label: 'destructive rm on root', regex: /\brm\s+-rf\s+\/(?:\s|$)/i },
@@ -71,6 +79,31 @@ let codebaseIndexCache = null
 let modelListCache
 let whereResultsCache
 const modelRefreshInFlight = new Map()
+
+function resolveCopilotRuntimeTokenUrls(env = process.env) {
+  const fromEnv = String(env.COPILOT_RUNTIME_TOKEN_URLS || '')
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean)
+
+  const values = []
+  const pushUnique = value => {
+    const normalized = String(value || '').trim().replace(/\/+$/, '')
+    if (!normalized) return
+    if (!values.includes(normalized)) values.push(normalized)
+  }
+
+  for (const value of fromEnv) pushUnique(value)
+  for (const value of DEFAULT_COPILOT_RUNTIME_TOKEN_URLS) pushUnique(value)
+
+  const rank = value => {
+    if (/\/copilot_internal\/v2\/token$/i.test(value)) return 0
+    if (/\/copilot_internal\/token$/i.test(value)) return 2
+    return 1
+  }
+
+  return values.sort((a, b) => rank(a) - rank(b))
+}
 
 function resolveOpenClawStateDirCandidates(env = process.env) {
   const values = []
@@ -530,7 +563,7 @@ async function endpointHealth({ endpoint, token, timeoutMs }) {
   try {
     const res = await fetch(modelsEndpoint, {
       method: 'GET',
-      headers: buildApiRequestHeaders(token),
+      headers: buildApiRequestHeaders(token, modelsEndpoint),
       signal: controller.signal,
     })
     return {
@@ -773,25 +806,41 @@ async function resolveCopilotRuntimeAuth({ githubToken, forceRefresh = false, ti
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), Math.min(timeoutMs, 20_000))
   try {
-    let lastError = 'Copilot token exchange failed'
+    const attempts = []
     for (const tokenUrl of COPILOT_RUNTIME_TOKEN_URLS) {
-      const res = await fetch(tokenUrl, {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': COPILOT_RUNTIME_TOKEN_EXCHANGE_USER_AGENT,
-          'X-GitHub-Api-Version': '2022-11-28',
-          Authorization: `Bearer ${sourceToken}`,
-        },
-        signal: controller.signal,
-      })
+      let res
+      try {
+        res = await fetch(tokenUrl, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': COPILOT_RUNTIME_TOKEN_EXCHANGE_USER_AGENT,
+            'X-GitHub-Api-Version': '2022-11-28',
+            Authorization: `Bearer ${sourceToken}`,
+          },
+          signal: controller.signal,
+        })
+      } catch (err) {
+        if (controller.signal.aborted) {
+          throw new Error(
+            `Copilot token exchange timed out after ${Math.min(timeoutMs, 20_000)}ms`
+          )
+        }
+        attempts.push(`${tokenUrl} -> ${err instanceof Error ? err.message : String(err)}`)
+        continue
+      }
 
       if (!res.ok) {
-        lastError = `${tokenUrl} -> HTTP ${res.status}`
+        attempts.push(`${tokenUrl} -> HTTP ${res.status}`)
         if (res.status === 404) {
           continue
         }
-        throw new Error(`Copilot token exchange failed: ${lastError}`)
+        if (res.status === 401 || res.status === 403) {
+          throw new Error(
+            `Copilot token exchange failed: ${tokenUrl} -> HTTP ${res.status} (token unauthorized for runtime exchange)`
+          )
+        }
+        throw new Error(`Copilot token exchange failed: ${tokenUrl} -> HTTP ${res.status}`)
       }
 
       const parsed = parseCopilotRuntimeTokenResponse(await res.json())
@@ -812,7 +861,11 @@ async function resolveCopilotRuntimeAuth({ githubToken, forceRefresh = false, ti
       }
     }
 
-    throw new Error(`Copilot token exchange failed: ${lastError}`)
+    throw new Error(
+      `Copilot token exchange failed: ${
+        attempts.length ? attempts.join('; ') : 'no token endpoints configured'
+      }`
+    )
   } finally {
     clearTimeout(timeout)
   }
@@ -845,7 +898,16 @@ function isCopilotRuntimeApiToken(token) {
   return /(?:^|;)\s*proxy-ep=/i.test(String(token || ''))
 }
 
-function buildApiRequestHeaders(token) {
+function isGitHubModelsEndpoint(endpoint) {
+  try {
+    const host = String(new URL(String(endpoint || '')).host || '').toLowerCase()
+    return host === 'models.github.ai'
+  } catch {
+    return false
+  }
+}
+
+function buildApiRequestHeaders(token, endpoint = '') {
   const headers = {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
@@ -856,6 +918,11 @@ function buildApiRequestHeaders(token) {
     headers['Editor-Plugin-Version'] = COPILOT_RUNTIME_EDITOR_PLUGIN_VERSION
     headers['User-Agent'] = COPILOT_RUNTIME_USER_AGENT
     headers['X-Github-Api-Version'] = COPILOT_RUNTIME_API_VERSION
+  }
+
+  if (isGitHubModelsEndpoint(endpoint)) {
+    headers.Accept = 'application/vnd.github+json'
+    headers['X-GitHub-Api-Version'] = '2022-11-28'
   }
 
   return headers
@@ -1036,7 +1103,7 @@ function parseArgs(argv) {
         : true,
     system:
       process.env.COPILOT_ASSISTANT_SYSTEM ||
-      'You are a practical personal coding assistant. Give concise, actionable help.',
+      DEFAULT_ASSISTANT_SYSTEM_PROMPT,
     prompt: '',
     timeoutMs: Number(process.env.COPILOT_TIMEOUT_MS || '60000'),
     temperature: Number(process.env.COPILOT_TEMPERATURE || '0.2'),
@@ -1413,17 +1480,24 @@ async function chatOnce({
   try {
     let res
     try {
+      const requestBody = {
+        model,
+        messages,
+        temperature,
+        ...(stream ? { stream: true } : {}),
+      }
+
+      if (isGitHubModelsEndpoint(endpoint)) {
+        requestBody.max_tokens = maxOutputTokens
+      } else {
+        requestBody.max_tokens = maxOutputTokens
+        requestBody.max_completion_tokens = maxOutputTokens
+      }
+
       res = await fetch(endpoint, {
         method: 'POST',
-        headers: buildApiRequestHeaders(token),
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature,
-          max_tokens: maxOutputTokens,
-          max_completion_tokens: maxOutputTokens,
-          ...(stream ? { stream: true } : {}),
-        }),
+        headers: buildApiRequestHeaders(token, endpoint),
+        body: JSON.stringify(requestBody),
         signal: controller.signal,
       })
     } catch (err) {
@@ -1991,6 +2065,15 @@ async function saveProfile(name, data) {
 }
 
 function deriveModelsEndpoint(chatEndpoint) {
+  if (isGitHubModelsEndpoint(chatEndpoint)) {
+    try {
+      const url = new URL(String(chatEndpoint || ''))
+      return `${url.origin}/catalog/models`
+    } catch {
+      return 'https://models.github.ai/catalog/models'
+    }
+  }
+
   return chatEndpoint.replace(/\/chat\/completions\/?$/, '/models')
 }
 
@@ -2008,7 +2091,7 @@ async function fetchModelsFromEndpoint({ endpoint, token, timeoutMs }) {
     try {
       res = await fetch(modelsEndpoint, {
         method: 'GET',
-        headers: buildApiRequestHeaders(token),
+        headers: buildApiRequestHeaders(token, modelsEndpoint),
         signal: controller.signal,
       })
     } catch (err) {
@@ -2660,7 +2743,8 @@ async function run() {
   const shouldTryCopilotRuntimeAuth =
     args.githubCopilotAuth &&
     runtimeAuth.sourceToken.length > 0 &&
-    args.tokenSource !== 'copilot_auth_token'
+    args.tokenSource !== 'copilot_auth_token' &&
+    !isGitHubModelsEndpoint(args.endpoint)
 
   if (shouldTryCopilotRuntimeAuth) {
     try {
